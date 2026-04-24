@@ -1,4 +1,4 @@
-# MAN++: Scaling Momentum Auxiliary Network
+# [TPAMI'26] MAN++: Scaling Momentum Auxiliary Network
 
 This repository contains the cleaned MAN++ release for the paper **MAN++: Scaling Momentum Auxiliary Network for Supervised Local Learning in Vision Tasks**, accepted by **IEEE TPAMI 2026**.
 
@@ -34,6 +34,8 @@ COCO/
   annotations/instances_train2017.json
   annotations/instances_val2017.json
 ```
+
+For COCO, the alternative layout `COCO/images/train2017` and `COCO/images/val2017` is also supported.
 
 ## CIFAR-10, SVHN, STL-10
 
@@ -105,34 +107,35 @@ Supported `--net` values are `vit_tiny`, `vit_small`, and `vit_base`. This relea
 
 ## COCO RetinaNet
 
+MAN++ K=4:
+
 ```bash
 cd Exp_on_COCO
 
 torchrun --nproc_per_node=8 train_coco.py /path/to/coco \
-  --backbone resnet50 --epochs 100 --batch-size 8 \
-  --lr 4e-4 --momentum-manpp 0.995 --img-size 640
+  --backbone resnet50 --training-mode manpp \
+  --batch-size 2 --lr 0.01 --momentum 0.9 --weight-decay 1e-4 \
+  --max-iters 90000 --lr-steps 60000 80000 \
+  --img-size 600 --max-size 1000 --flip-prob 0.5 \
+  --momentum-manpp 0.995 --eval-freq 10 \
+  --output ./outputs/coco_resnet50_manpp_k4
 ```
 
-Supported COCO backbones are `resnet50`, `resnet101`, and `resnet152`. MAN++ uses `K=4` for all of them.
-
-## Smoke Tests
-
-These commands check syntax and the lightweight model paths without launching full training:
+BP baseline:
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/manpp_pycache python -m py_compile \
-  $(find Exp_on_CIFAR-SVHN-STL Exp_on_ImageNet Exp_on_COCO \
-  -path '*/data/*' -prune -o -name '*.py' -print | sort)
+cd Exp_on_COCO
 
-cd Exp_on_CIFAR-SVHN-STL
-CUDA_VISIBLE_DEVICES=0 python train.py --dataset cifar10 --layers 32 \
-  --local_module_num 16 --arch resnetInfoPro_MANPP \
-  --local_loss_mode cross_entropy --aux_net_feature_dim 128 \
-  --momentum 0.995 --dry-run-model
-
-cd ../Exp_on_ImageNet
-CUDA_VISIBLE_DEVICES= python imagenet_DDP.py --smoke-test
+torchrun --nproc_per_node=8 train_coco.py /path/to/coco \
+  --backbone resnet50 --training-mode bp \
+  --batch-size 2 --lr 0.01 --momentum 0.9 --weight-decay 1e-4 \
+  --max-iters 90000 --lr-steps 60000 80000 \
+  --img-size 600 --max-size 1000 --flip-prob 0.5 \
+  --eval-freq 10 \
+  --output ./outputs/coco_resnet50_bp
 ```
+
+Supported COCO backbones are `resnet50`, `resnet101`, and `resnet152`. MAN++ uses `K=4` for all of them. The default COCO recipe follows the RetinaNet paper: 8-GPU synchronized SGD, batch size 16 total, initial LR 0.01, 10x decay at 60k/80k iterations, 90k iterations, shorter-side image scale 600 with max size 1000, and horizontal flipping. COCO validation runs every 10 epochs by default and always runs on the final epoch; change this with `--eval-freq`.
 
 ## Citation
 
