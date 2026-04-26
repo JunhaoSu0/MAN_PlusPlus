@@ -1,4 +1,4 @@
-# [TPAMI'26] MAN++: Scaling Momentum Auxiliary Network
+# [TPAMI'26] MAN++: Scaling Momentum Auxiliary Network for Supervised Local Learning in Vision Tasks
 
 This repository contains the cleaned MAN++ release for the paper **MAN++: Scaling Momentum Auxiliary Network for Supervised Local Learning in Vision Tasks**, accepted by **IEEE TPAMI 2026**.
 
