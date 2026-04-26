@@ -7,6 +7,7 @@ import torch.nn as nn
 
 
 MANPP_K = 4
+MANPP_VIT_AUX_DEPTH = 2
 
 
 # -------- Drop-Path ---------------------------------------------------------
@@ -93,18 +94,26 @@ class Block(nn.Module):
 
 
 class MANPPAuxClassifier(nn.Module):
-    """MAN++ auxiliary head: s * LB(x) + (2 - s) * EMA(x), then LN + FC."""
-    def __init__(self, lb_block: nn.Module, ema_block: nn.Module,
+    """
+    MAN++ auxiliary head.
+
+    The first auxiliary block uses MAN++ fusion:
+        s * LB_0(x) + (2 - s) * EMA_0(x)
+    The second auxiliary block is a lightweight learnable-only LB block.
+    """
+    def __init__(self, lb_blocks: nn.Module, ema_block: nn.Module,
                  classes: int, dim: int):
         super().__init__()
-        self.lb_block  = lb_block          # learnable bias branch
-        self.ema_block = ema_block         # EMA branch (frozen)
+        self.lb_block  = lb_blocks         # learnable bias branch
+        self.ema_block = ema_block         # frozen EMA copy of first aux block
         self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.head = nn.Linear(dim, classes)
         self.s    = nn.Parameter(torch.tensor(1.0))  # learnable scale per group
 
     def forward(self, features):
-        y = self.s * self.lb_block(features) + (2 - self.s) * self.ema_block(features)
+        y = self.s * self.lb_block[0](features) + (2 - self.s) * self.ema_block(features)
+        for block in self.lb_block[1:]:
+            y = block(y)
         return self.head(self.norm(y)[:, 0])
 
 
@@ -128,6 +137,11 @@ class MANPPVisionTransformer(nn.Module):
         self.momentum = momentum
         self.manpp_k = groups
         self.num_aux_stages = groups - 1
+        self.aux_depth = MANPP_VIT_AUX_DEPTH
+        if self.aux_depth > self.bp_g:
+            raise ValueError(
+                f'ViT MAN++ aux depth {self.aux_depth} exceeds group depth {self.bp_g}.'
+            )
 
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.patch = PatchEmbed(img_size, patch_size, in_c, embed_dim, norm_layer)
@@ -150,7 +164,8 @@ class MANPPVisionTransformer(nn.Module):
 
         for g in range(groups - 1):
             next_first = (g + 1) * self.bp_g   # index of first block in next group
-            lb_block  = copy.deepcopy(self.blocks[next_first])
+            next_blocks = self.blocks[next_first:next_first + self.aux_depth]
+            lb_block  = nn.Sequential(*[copy.deepcopy(b) for b in next_blocks])
             ema_block = copy.deepcopy(self.blocks[next_first])
             # freeze EMA branch
             for p in ema_block.parameters():
@@ -262,6 +277,7 @@ vit_base_patch16_224 = manpp_vit_base_patch16_224
 
 __all__ = [
     'MANPP_K',
+    'MANPP_VIT_AUX_DEPTH',
     'MANPPAuxClassifier',
     'MANPPVisionTransformer',
     'MANPP_VIT_FACTORIES',

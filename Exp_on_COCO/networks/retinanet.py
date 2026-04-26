@@ -49,10 +49,10 @@ class FPN(nn.Module):
 
 # ────────────────────── Classification & Box Subnets ─────────────────
 class ClassificationSubnet(nn.Module):
-    def __init__(self, in_channels, num_anchors, num_classes):
+    def __init__(self, in_channels, num_anchors, num_classes, num_convs=4):
         super().__init__()
         layers = []
-        for _ in range(4):
+        for _ in range(num_convs):
             layers += [
                 nn.Conv2d(in_channels, in_channels, 3, padding=1),
                 nn.ReLU(inplace=True),
@@ -73,10 +73,10 @@ class ClassificationSubnet(nn.Module):
 
 
 class RegressionSubnet(nn.Module):
-    def __init__(self, in_channels, num_anchors):
+    def __init__(self, in_channels, num_anchors, num_convs=4):
         super().__init__()
         layers = []
-        for _ in range(4):
+        for _ in range(num_convs):
             layers += [
                 nn.Conv2d(in_channels, in_channels, 3, padding=1),
                 nn.ReLU(inplace=True),
@@ -100,13 +100,17 @@ class Anchors(nn.Module):
     """Generate anchors for all FPN levels."""
 
     def __init__(self, sizes=(32, 64, 128, 256, 512),
+                 strides=(8, 16, 32, 64, 128),
                  ratios=(0.5, 1.0, 2.0),
                  scales=(2 ** 0, 2 ** (1/3), 2 ** (2/3))):
         super().__init__()
         self.sizes  = sizes
+        self.strides = strides
         self.ratios = ratios
         self.scales = scales
         self.num_anchors = len(ratios) * len(scales)
+        if len(self.sizes) != len(self.strides):
+            raise ValueError("anchor sizes and strides must have the same length")
 
     def _generate_base(self, size):
         anchors = []
@@ -121,10 +125,9 @@ class Anchors(nn.Module):
         """features: list of feature maps [P3..P7]."""
         all_anchors = []
         device = features[0].device
-        for level, (feat, size) in enumerate(zip(features, self.sizes)):
+        for feat, size, stride in zip(features, self.sizes, self.strides):
             _, _, H, W = feat.shape
             base = self._generate_base(size).to(device)
-            stride = 2 ** (3 + level)  # P3->8, P4->16, ...
             grid_x = torch.arange(W, device=device, dtype=torch.float32)
             grid_y = torch.arange(H, device=device, dtype=torch.float32)
             shift_x = (grid_x * stride + stride / 2).repeat(H)
@@ -133,6 +136,50 @@ class Anchors(nn.Module):
             anchors = (shifts.unsqueeze(1) + base.unsqueeze(0)).reshape(-1, 4)
             all_anchors.append(anchors)
         return torch.cat(all_anchors, dim=0)
+
+
+class AuxiliaryDetectionHead(nn.Module):
+    """
+    Lightweight local detection head for MAN++ blocks.
+
+    Each local block supervises the RetinaNet pyramid levels that match its
+    stride: block0 -> P3, block1 -> P4, block2 -> P5/P6/P7.
+    """
+
+    def __init__(self, in_channels, num_anchors, num_classes, sizes, strides,
+                 out_channels=256, num_convs=2):
+        super().__init__()
+        self.project = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1),
+            nn.ReLU(inplace=False),
+        )
+        self.extra_levels = nn.ModuleList()
+        for _ in range(1, len(sizes)):
+            self.extra_levels.append(nn.Sequential(
+                nn.ReLU(inplace=False),
+                nn.Conv2d(out_channels, out_channels, 3, stride=2, padding=1),
+            ))
+        self.anchors_gen = Anchors(sizes=sizes, strides=strides)
+        self.cls_subnet = ClassificationSubnet(
+            out_channels, num_anchors, num_classes, num_convs=num_convs)
+        self.reg_subnet = RegressionSubnet(
+            out_channels, num_anchors, num_convs=num_convs)
+
+        for m in self.project.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
+        for block in self.extra_levels:
+            for m in block.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.normal_(m.weight, 0, 0.01)
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        features = [self.project(x)]
+        for block in self.extra_levels:
+            features.append(block(features[-1]))
+        return features, self.anchors_gen(features)
 
 
 # ────────────────────────── Focal Loss ───────────────────────────────
@@ -258,7 +305,8 @@ class RetinaNet(nn.Module):
     inside backbone.forward), then FPN + detection head loss is returned.
     """
 
-    def __init__(self, backbone, num_classes=80, fpn_channels=256):
+    def __init__(self, backbone, num_classes=80, fpn_channels=256,
+                 aux_head_convs=2):
         super().__init__()
         self.backbone = backbone
         self.fpn = FPN(
@@ -273,8 +321,47 @@ class RetinaNet(nn.Module):
         self.cls_subnet = ClassificationSubnet(fpn_channels, self.num_anchors, num_classes)
         self.reg_subnet = RegressionSubnet(fpn_channels, self.num_anchors)
         self.focal_loss = FocalLoss()
+        self.aux_det_heads = nn.ModuleList([
+            AuxiliaryDetectionHead(
+                backbone.C3_channels, self.num_anchors, num_classes,
+                sizes=(32,), strides=(8,), out_channels=fpn_channels,
+                num_convs=aux_head_convs),
+            AuxiliaryDetectionHead(
+                backbone.C4_channels, self.num_anchors, num_classes,
+                sizes=(64,), strides=(16,), out_channels=fpn_channels,
+                num_convs=aux_head_convs),
+            AuxiliaryDetectionHead(
+                backbone.C5_channels, self.num_anchors, num_classes,
+                sizes=(128, 256, 512), strides=(32, 64, 128),
+                out_channels=fpn_channels, num_convs=aux_head_convs),
+        ])
 
-    def forward(self, images, targets=None, compute_loss=None, local_aux_backward=None):
+    def _predict_from_features(self, features, cls_subnet, reg_subnet):
+        cls_list, reg_list = [], []
+        for f in features:
+            c = cls_subnet(f)
+            r = reg_subnet(f)
+            B_, _, H_, W_ = c.shape
+            c = c.view(B_, self.num_anchors, self.num_classes, H_, W_)
+            c = c.permute(0, 3, 4, 1, 2).reshape(B_, -1, self.num_classes)
+            r = r.view(B_, self.num_anchors, 4, H_, W_)
+            r = r.permute(0, 3, 4, 1, 2).reshape(B_, -1, 4)
+            cls_list.append(c)
+            reg_list.append(r)
+        return torch.cat(cls_list, dim=1), torch.cat(reg_list, dim=1)
+
+    def _local_aux_loss(self, idx, feature, targets):
+        aux_features, anchors = self.aux_det_heads[idx](feature)
+        cls_preds, reg_preds = self._predict_from_features(
+            aux_features,
+            self.aux_det_heads[idx].cls_subnet,
+            self.aux_det_heads[idx].reg_subnet,
+        )
+        cls_loss, reg_loss = self.focal_loss(cls_preds, reg_preds, anchors, targets)
+        return cls_loss + reg_loss
+
+    def forward(self, images, targets=None, compute_loss=None,
+                local_aux_backward=None, aux_backward_fn=None):
         """
         Args:
             images: (B, 3, H, W)
@@ -285,7 +372,6 @@ class RetinaNet(nn.Module):
             losses: dict {"cls_loss", "reg_loss", "aux_loss"}
             preds:  dict {"cls_preds", "reg_preds", "anchors"}
         """
-        B = images.size(0)
         if compute_loss is None:
             compute_loss = self.training and targets is not None
         if compute_loss and targets is None:
@@ -296,14 +382,10 @@ class RetinaNet(nn.Module):
         local_aux_backward = bool(local_aux_backward and torch.is_grad_enabled())
 
         if local_aux_backward:
-            # Make pseudo-labels for aux heads (use majority class per image or 0)
-            aux_labels = torch.zeros(B, dtype=torch.long, device=images.device)
-            for i, t in enumerate(targets):
-                if t["labels"].numel() > 0:
-                    aux_labels[i] = t["labels"].mode().values.long()
-
             feats, aux_loss = self.backbone(
-                images, aux_labels, local_aux_backward=True)
+                images, targets, local_aux_backward=True,
+                aux_loss_fn=self._local_aux_loss,
+                aux_backward_fn=aux_backward_fn)
         else:
             feats = self.backbone(images)
             aux_loss = images.new_zeros(())
@@ -311,20 +393,8 @@ class RetinaNet(nn.Module):
         fpn_feats = self.fpn(feats)
         anchors = self.anchors_gen(fpn_feats)
 
-        cls_list, reg_list = [], []
-        for f in fpn_feats:
-            c = self.cls_subnet(f)
-            r = self.reg_subnet(f)
-            B_, _, H_, W_ = c.shape
-            c = c.view(B_, self.num_anchors, self.num_classes, H_, W_)
-            c = c.permute(0, 3, 4, 1, 2).reshape(B_, -1, self.num_classes)
-            r = r.view(B_, self.num_anchors, 4, H_, W_)
-            r = r.permute(0, 3, 4, 1, 2).reshape(B_, -1, 4)
-            cls_list.append(c)
-            reg_list.append(r)
-
-        cls_preds = torch.cat(cls_list, dim=1)
-        reg_preds = torch.cat(reg_list, dim=1)
+        cls_preds, reg_preds = self._predict_from_features(
+            fpn_feats, self.cls_subnet, self.reg_subnet)
 
         if compute_loss:
             cls_loss, reg_loss = self.focal_loss(cls_preds, reg_preds, anchors, targets)

@@ -7,8 +7,8 @@ Split points (K=4):
   Block 2: layer3
   Block 3: layer4  (no auxiliary head — direct to detection head)
 
-Auxiliary heads on blocks 0, 1, 2 use EMA + LB + learnable scale s.
-EMA source for block j is the first residual unit of block j+1.
+Auxiliary detection heads on blocks 0, 1, 2 use EMA + LB + learnable
+scale s. EMA source for block j is the first residual unit of block j+1.
 """
 
 import copy
@@ -91,23 +91,6 @@ class Bottleneck(nn.Module):
         return self.relu(out + identity)
 
 
-# ──────────────── lightweight auxiliary classifier ──────────────────
-class AuxClassifier(nn.Module):
-    """Conv-based auxiliary head for intermediate feature maps."""
-    def __init__(self, in_channels, num_classes=1000):
-        super().__init__()
-        self.head = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 1, bias=False), nn.BatchNorm2d(256), nn.ReLU(True),
-            nn.Conv2d(256, 256, 3, 2, 1, bias=False),   nn.BatchNorm2d(256), nn.ReLU(True),
-            nn.Conv2d(256, 512, 3, 2, 1, bias=False),   nn.BatchNorm2d(512), nn.ReLU(True),
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
-            nn.Linear(512, num_classes),
-        )
-
-    def forward(self, x):
-        return self.head(x)
-
-
 # ──────────────────── ResNet-MAN++ backbone ────────────────────────
 class ResNetMANPP(nn.Module):
     """
@@ -152,10 +135,8 @@ class ResNetMANPP(nn.Module):
         self.LB      = nn.ModuleList()
         self.EMA_Net = nn.ModuleList()
         self.ema_s   = nn.ParameterList()
-        self.aux     = nn.ModuleList()
 
         ema_sources = [self.layer2[0], self.layer3[0], self.layer4[0]]
-        aux_channels = [self.C3_channels, self.C4_channels, self.C5_channels]
 
         for i in range(3):
             lb  = copy.deepcopy(ema_sources[i])
@@ -165,9 +146,6 @@ class ResNetMANPP(nn.Module):
             self.LB.append(lb)
             self.EMA_Net.append(ema)
             self.ema_s.append(nn.Parameter(torch.tensor(1.0)))
-            self.aux.append(AuxClassifier(aux_channels[i], num_classes))
-
-        self.criterion_ce = nn.CrossEntropyLoss()
 
         # ---- stateful counter for block-wise training ----
         self.block_idx = 0
@@ -210,7 +188,8 @@ class ResNetMANPP(nn.Module):
             p_ema.data.mul_(self.momentum).add_(p_src.data, alpha=1 - self.momentum)
 
     # ----------------------------------------------------------------
-    def forward_train(self, x, target):
+    def forward_train(self, x, targets, aux_loss_fn, local_aux_backward=True,
+                      aux_backward_fn=None):
         """
         Called repeatedly for each local block.
         Returns:
@@ -230,12 +209,16 @@ class ResNetMANPP(nn.Module):
             # MAN++ auxiliary head: y = s * LB(x) + (2-s) * EMA(x)
             s = self.ema_s[idx]
             y = s * self.LB[idx](x) + (2 - s) * self.EMA_Net[idx](x)
-            aux_logits = self.aux[idx](y)
-            aux_loss = self.criterion_ce(aux_logits, target)
+            aux_loss = aux_loss_fn(idx, y, targets)
+            if local_aux_backward:
+                if aux_backward_fn is None:
+                    aux_loss.backward()
+                else:
+                    aux_backward_fn(aux_loss)
 
             self._ema_update(idx)
             self.block_idx += 1
-            return x.detach(), aux_loss
+            return x.detach(), aux_loss.detach()
 
         else:
             # last block — return nothing; caller collects features
@@ -252,7 +235,8 @@ class ResNetMANPP(nn.Module):
         c5 = self.layer4(c4)
         return {"C3": c3, "C4": c4, "C5": c5}
 
-    def forward_train_full(self, images, target):
+    def forward_train_full(self, images, targets, aux_loss_fn,
+                           aux_backward_fn=None):
         """
         Run all 4 blocks sequentially (as in local learning).
         Returns (feature_dict, total_aux_loss).
@@ -261,11 +245,14 @@ class ResNetMANPP(nn.Module):
         total_aux = torch.tensor(0.0, device=images.device)
         for blk in range(4):
             if blk < 3:
-                x, aux_loss = self.forward_train(x, target)
-                aux_loss.backward()
-                total_aux = total_aux + aux_loss.detach()
+                x, aux_loss = self.forward_train(
+                    x, targets, aux_loss_fn,
+                    aux_backward_fn=aux_backward_fn)
+                total_aux = total_aux + aux_loss
             else:
-                x, _ = self.forward_train(x, target)
+                x, _ = self.forward_train(
+                    x, targets, aux_loss_fn,
+                    aux_backward_fn=aux_backward_fn)
 
         # Now x is C5. We need C3, C4 too for FPN.
         # Re-derive them from stored block outputs.
@@ -273,7 +260,8 @@ class ResNetMANPP(nn.Module):
         # Let's refactor: use a dedicated method.
         raise NotImplementedError("Use forward_train_collect instead.")
 
-    def forward_train_collect(self, images, target, local_aux_backward=True):
+    def forward_train_collect(self, images, targets, aux_loss_fn,
+                              local_aux_backward=True, aux_backward_fn=None):
         """
         Run all 4 local blocks. Backward aux losses along the way.
         Returns: feature_dict {"C3", "C4", "C5"}, total_aux_loss (for logging).
@@ -287,9 +275,12 @@ class ResNetMANPP(nn.Module):
         x = self.layer1(x)
         s0 = self.ema_s[0]
         y0 = s0 * self.LB[0](x) + (2 - s0) * self.EMA_Net[0](x)
-        aux0 = self.criterion_ce(self.aux[0](y0), target)
+        aux0 = aux_loss_fn(0, y0, targets)
         if local_aux_backward:
-            aux0.backward()
+            if aux_backward_fn is None:
+                aux0.backward()
+            else:
+                aux_backward_fn(aux0)
         self._ema_update(0)
         total_aux = total_aux + aux0.detach()
         x = x.detach()
@@ -299,9 +290,12 @@ class ResNetMANPP(nn.Module):
         feats["C3"] = x
         s1 = self.ema_s[1]
         y1 = s1 * self.LB[1](x) + (2 - s1) * self.EMA_Net[1](x)
-        aux1 = self.criterion_ce(self.aux[1](y1), target)
+        aux1 = aux_loss_fn(1, y1, targets)
         if local_aux_backward:
-            aux1.backward()
+            if aux_backward_fn is None:
+                aux1.backward()
+            else:
+                aux_backward_fn(aux1)
         self._ema_update(1)
         total_aux = total_aux + aux1.detach()
         x = x.detach()
@@ -312,9 +306,12 @@ class ResNetMANPP(nn.Module):
         feats["C4"] = x
         s2 = self.ema_s[2]
         y2 = s2 * self.LB[2](x) + (2 - s2) * self.EMA_Net[2](x)
-        aux2 = self.criterion_ce(self.aux[2](y2), target)
+        aux2 = aux_loss_fn(2, y2, targets)
         if local_aux_backward:
-            aux2.backward()
+            if aux_backward_fn is None:
+                aux2.backward()
+            else:
+                aux_backward_fn(aux2)
         self._ema_update(2)
         total_aux = total_aux + aux2.detach()
         x = x.detach()
@@ -326,14 +323,19 @@ class ResNetMANPP(nn.Module):
 
         return feats, total_aux
 
-    def forward(self, x, target=None, local_aux_backward=None):
+    def forward(self, x, target=None, local_aux_backward=None, aux_loss_fn=None,
+                aux_backward_fn=None):
         if local_aux_backward is None:
             local_aux_backward = self.training and target is not None and torch.is_grad_enabled()
         local_aux_backward = bool(local_aux_backward and torch.is_grad_enabled())
 
         if target is not None:
             if local_aux_backward:
-                return self.forward_train_collect(x, target, local_aux_backward=True)
+                if aux_loss_fn is None:
+                    raise ValueError("aux_loss_fn is required for MAN++ COCO local detection loss")
+                return self.forward_train_collect(
+                    x, target, aux_loss_fn, local_aux_backward=True,
+                    aux_backward_fn=aux_backward_fn)
             return self.forward_inference(x), x.new_zeros(())
 
         return self.forward_inference(x)

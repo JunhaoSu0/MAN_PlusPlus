@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torchvision.transforms as T
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -49,6 +50,8 @@ parser.add_argument("--weight-decay", default=1e-4, type=float)
 parser.add_argument("--momentum-manpp", "--momentum-man", dest="momentum_manpp",
                     default=0.995, type=float, help="EMA momentum for MAN++")
 parser.add_argument("--num-classes", default=80, type=int)
+parser.add_argument("--aux-head-convs", default=2, type=int,
+                    help="number of conv layers in each MAN++ auxiliary detection head")
 parser.add_argument("--img-size", default=600, type=int,
                     help="shorter-side image scale")
 parser.add_argument("--max-size", default=1000, type=int,
@@ -56,6 +59,17 @@ parser.add_argument("--max-size", default=1000, type=int,
 parser.add_argument("--flip-prob", default=0.5, type=float,
                     help="training horizontal flip probability")
 parser.add_argument("-j", "--workers", default=8, type=int)
+parser.add_argument("--prefetch-factor", default=2, type=int,
+                    help="DataLoader prefetch factor when workers > 0")
+parser.add_argument("--no-persistent-workers", dest="persistent_workers",
+                    action="store_false",
+                    help="disable persistent DataLoader workers")
+parser.set_defaults(persistent_workers=True)
+parser.add_argument("--amp", action="store_true",
+                    help="use CUDA automatic mixed precision")
+parser.add_argument("--no-tf32", dest="tf32", action="store_false",
+                    help="disable TF32 matmul/cuDNN on supported GPUs")
+parser.set_defaults(tf32=True)
 parser.add_argument("--print-freq", default=50, type=int)
 parser.add_argument("--eval-freq", default=10, type=int,
                     help="run validation every N epochs; also validates on the final epoch")
@@ -184,6 +198,8 @@ def main_worker(gpu):
         print(f"[Rank {gpu}] DDP init OK (world={args.world_size})", flush=True)
 
     torch.cuda.set_device(gpu)
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    torch.backends.cudnn.allow_tf32 = args.tf32
 
     # ---- model ----
     backbone_fn = {
@@ -197,7 +213,9 @@ def main_worker(gpu):
         num_classes=args.num_classes,
         momentum=args.momentum_manpp,
     )
-    model = RetinaNet(backbone, num_classes=args.num_classes).cuda(gpu)
+    model = RetinaNet(
+        backbone, num_classes=args.num_classes,
+        aux_head_convs=args.aux_head_convs).cuda(gpu)
 
     if args.distributed:
         model = nn.parallel.DistributedDataParallel(
@@ -207,6 +225,7 @@ def main_worker(gpu):
     optimizer = torch.optim.SGD(
         model.parameters(), lr=args.lr, momentum=args.momentum,
         weight_decay=args.weight_decay)
+    scaler = GradScaler(enabled=args.amp)
 
     # ---- resume ----
     start_epoch = 0
@@ -239,13 +258,21 @@ def main_worker(gpu):
         train=False, flip_prob=0.0)
 
     train_sampler = DistributedSampler(train_set) if args.distributed else None
+    loader_kwargs = {
+        "num_workers": args.workers,
+        "pin_memory": True,
+        "collate_fn": collate_fn,
+    }
+    if args.workers > 0:
+        loader_kwargs["persistent_workers"] = args.persistent_workers
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size,
         shuffle=(train_sampler is None), sampler=train_sampler,
-        num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+        **loader_kwargs)
     val_loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, collate_fn=collate_fn)
+        **loader_kwargs)
 
     # ---- training loop ----
     loss_history = []
@@ -254,7 +281,7 @@ def main_worker(gpu):
             train_sampler.set_epoch(epoch)
 
         train_loss, global_iter = train_one_epoch(
-            train_loader, model, optimizer, epoch, gpu, global_iter)
+            train_loader, model, optimizer, scaler, epoch, gpu, global_iter)
         reached_max_iters = args.max_iters > 0 and global_iter >= args.max_iters
         do_eval = ((epoch + 1) % args.eval_freq == 0) or \
                   (epoch + 1 == args.epochs) or reached_max_iters
@@ -297,10 +324,18 @@ def main_worker(gpu):
 
 
 # ────────────────────────── train / val ──────────────────────────────
-def train_one_epoch(loader, model, optimizer, epoch, gpu, global_iter):
+def train_one_epoch(loader, model, optimizer, scaler, epoch, gpu, global_iter):
     model.train()
     meter = AverageMeter()
     end = time.time()
+    use_amp = scaler.is_enabled()
+
+    def backward_loss(loss):
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
     for i, (images, targets) in enumerate(loader):
         if args.max_iters > 0 and global_iter >= args.max_iters:
             break
@@ -309,13 +344,21 @@ def train_one_epoch(loader, model, optimizer, epoch, gpu, global_iter):
 
         adjust_lr(optimizer, global_iter)
         optimizer.zero_grad(set_to_none=True)
-        out = model(
-            images, targets,
-            local_aux_backward=(args.training_mode == "manpp"))
-        loss = out["cls_loss"] + out["reg_loss"]
-        loss.backward()
+        with autocast(enabled=args.amp):
+            out = model(
+                images, targets,
+                local_aux_backward=(args.training_mode == "manpp"),
+                aux_backward_fn=backward_loss)
+            loss = out["cls_loss"] + out["reg_loss"]
+        backward_loss(loss)
+        if use_amp:
+            scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         global_iter += 1
 
         meter.update(loss.item(), images.size(0))
@@ -339,8 +382,9 @@ def validate(loader, model, gpu):
     for images, targets in loader:
         images = images.cuda(gpu, non_blocking=True)
         targets = [{k: v.cuda(gpu) for k, v in t.items()} for t in targets]
-        out = model(images, targets, compute_loss=True, local_aux_backward=False)
-        loss = out["cls_loss"] + out["reg_loss"]
+        with autocast(enabled=args.amp):
+            out = model(images, targets, compute_loss=True, local_aux_backward=False)
+            loss = out["cls_loss"] + out["reg_loss"]
         meter.update(loss.item(), images.size(0))
     return meter.avg
 

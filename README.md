@@ -90,7 +90,7 @@ cd Exp_on_ImageNet
 
 torchrun --nproc_per_node=8 imagenet_DDP_vit.py /path/to/imagenet \
   --net vit_tiny --local_module_num 4 \
-  --batch-size 1024 --lr 0.001 --epochs 100 --workers 16
+  --batch-size 128 --lr 0.001 --epochs 90 --workers 16
 ```
 
 BP baseline:
@@ -100,10 +100,10 @@ cd Exp_on_ImageNet
 
 torchrun --nproc_per_node=8 imagenet_DDP_vit_bp.py /path/to/imagenet \
   --net vit_tiny \
-  --batch-size 1024 --lr 0.001 --epochs 100 --workers 16
+  --batch-size 128 --lr 0.001 --epochs 90 --workers 16
 ```
 
-Supported `--net` values are `vit_tiny`, `vit_small`, and `vit_base`. This release supports ViT `K=4` only.
+Supported `--net` values are `vit_tiny`, `vit_small`, and `vit_base`. This release supports ViT `K=4` only. `--batch-size` is per GPU, so the examples above use total batch size 1024 on 8 GPUs.
 
 ## COCO RetinaNet
 
